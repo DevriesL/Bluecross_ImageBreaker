@@ -1,3 +1,9 @@
+# Add KBUILD_OPTIONS from Makefile
+MODNAME := wlan
+TARGET_BUILD_VARIANT := user
+WLAN_DISABLE_BUILD_TAG := y
+WLAN_ROOT := drivers/staging/qcacld-3.0
+
 # We can build either as part of a standalone Kernel build or as
 # an external module.  Determine which mechanism is being used
 ifeq ($(MODNAME),)
