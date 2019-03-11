@@ -2037,6 +2037,14 @@ config SYSTEM_DATA_VERIFICATION
 	  module verification, kexec image verification and firmware blob
 	  verification.
 
+config DEFERRED_INITCALLS
+	bool "Deferred initcalls support"
+	default n
+	help
+	  Say 'y' here to include support for deferred initcalls.
+	  If some module init functions set as deferred initcall, they aren't
+	  called until /proc/deferred_initcalls is read.
+
 config PROFILING
 	bool "Profiling support"
 	help
