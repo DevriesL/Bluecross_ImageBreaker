@@ -95,6 +95,34 @@ extern void init_IRQ(void);
 extern void fork_init(void);
 extern void radix_tree_init(void);
 
+#ifdef CONFIG_DEFERRED_INITCALLS
+extern initcall_t __deferred_initcall_start[], __deferred_initcall_end[];
+
+/* call deferred init routines */
+static void __ref do_deferred_initcalls(struct work_struct *work)
+{
+	initcall_t *call;
+	static bool already_run;
+
+	if (already_run) {
+		pr_warn("%s() has already run\n", __func__);
+		return;
+	}
+
+	already_run = true;
+
+	pr_err("Running %s()\n", __func__);
+
+	for (call = __deferred_initcall_start;
+			call < __deferred_initcall_end; call++)
+		do_one_initcall(*call);
+
+	free_initmem();
+}
+
+static DECLARE_DELAYED_WORK(deferred_initcall_work, do_deferred_initcalls);
+#endif
+
 /*
  * Debug helper: via this flag we know that we are in 'early bootup code'
  * where only the boot processor is running with IRQ disabled.  This means
@@ -948,7 +976,9 @@ static int __ref kernel_init(void *unused)
 	kernel_init_freeable();
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
+#ifndef CONFIG_DEFERRED_INITCALLS
 	free_initmem();
+#endif
 	mark_readonly();
 	system_state = SYSTEM_RUNNING;
 	numa_default_policy();
@@ -971,8 +1001,13 @@ static int __ref kernel_init(void *unused)
 	 */
 	if (execute_command) {
 		ret = run_init_process(execute_command);
-		if (!ret)
+		if (!ret) {
+#ifdef CONFIG_DEFERRED_INITCALLS
+			// Waiting for 500 milliseconds to let filesystem get ready
+			schedule_delayed_work(&deferred_initcall_work, msecs_to_jiffies(500));
+#endif
 			return 0;
+		}
 		panic("Requested init %s failed (error %d).",
 		      execute_command, ret);
 	}
