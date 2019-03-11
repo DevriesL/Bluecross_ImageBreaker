@@ -895,7 +895,7 @@ int sec_ts_firmware_update_on_probe(struct sec_ts_data *ts, bool force_update)
 					__func__, fw_path, ts->cal_status);
 
 	/* Loading Firmware */
-	if (request_firmware(&fw_entry, fw_path, &ts->client->dev) !=  0) {
+	if (request_firmware_direct(&fw_entry, fw_path, &ts->client->dev) !=  0) {
 		input_err(true, &ts->client->dev, "%s: firmware is not available\n", __func__);
 		goto err_request_fw;
 	}
