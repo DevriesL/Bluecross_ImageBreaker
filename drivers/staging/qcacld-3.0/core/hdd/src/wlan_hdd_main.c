@@ -13215,7 +13215,7 @@ bool hdd_is_cli_iface_up(hdd_context_t *hdd_ctx)
 }
 
 /* Register the module init/exit functions */
-module_init(hdd_module_init);
+deferred_module_init(hdd_module_init);
 module_exit(hdd_module_exit);
 
 MODULE_LICENSE("Dual BSD/GPL");

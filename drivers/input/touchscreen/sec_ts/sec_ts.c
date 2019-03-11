@@ -3067,5 +3067,5 @@ MODULE_AUTHOR("Hyobae, Ahn<hyobae.ahn@samsung.com>");
 MODULE_DESCRIPTION("Samsung Electronics TouchScreen driver");
 MODULE_LICENSE("GPL");
 
-module_init(sec_ts_init);
+deferred_module_init(sec_ts_init);
 module_exit(sec_ts_exit);

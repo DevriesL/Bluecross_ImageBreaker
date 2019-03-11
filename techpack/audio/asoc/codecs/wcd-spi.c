@@ -1672,7 +1672,11 @@ static struct spi_driver wcd_spi_driver = {
 	.remove = wcd_spi_remove,
 };
 
-module_spi_driver(wcd_spi_driver);
+static int __init wcd_spi_driver_init(void)
+{
+	return spi_register_driver(&wcd_spi_driver);
+}
+deferred_module_init(wcd_spi_driver_init);
 
 MODULE_DESCRIPTION("WCD SPI driver");
 MODULE_LICENSE("GPL v2");

@@ -41,7 +41,7 @@ static int __init wcd9xxx_core_init(void)
 
 	return 0;
 }
-module_init(wcd9xxx_core_init);
+deferred_module_init(wcd9xxx_core_init);
 
 static void __exit wcd9xxx_core_exit(void)
 {

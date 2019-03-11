@@ -7283,7 +7283,12 @@ static struct platform_driver sdm845_asoc_machine_driver = {
 	.probe = msm_asoc_machine_probe,
 	.remove = msm_asoc_machine_remove,
 };
-module_platform_driver(sdm845_asoc_machine_driver);
+
+static int __init sdm845_asoc_machine_driver_init(void)
+{
+	return platform_driver_register(&sdm845_asoc_machine_driver);
+}
+deferred_module_init(sdm845_asoc_machine_driver_init);
 
 MODULE_DESCRIPTION("ALSA SoC msm");
 MODULE_LICENSE("GPL v2");

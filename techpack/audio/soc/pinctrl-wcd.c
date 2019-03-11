@@ -429,7 +429,11 @@ static struct platform_driver wcd_pinctrl_driver = {
 	.remove = wcd_pinctrl_remove,
 };
 
-module_platform_driver(wcd_pinctrl_driver);
+static int __init wcd_pinctrl_driver_init(void)
+{
+	return platform_driver_register(&wcd_pinctrl_driver);
+}
+deferred_module_init(wcd_pinctrl_driver_init);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc WCD GPIO pin control driver");
 MODULE_LICENSE("GPL v2");
