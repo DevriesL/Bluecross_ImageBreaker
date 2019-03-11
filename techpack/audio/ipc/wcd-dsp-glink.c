@@ -1237,7 +1237,11 @@ static struct platform_driver wdsp_glink_driver = {
 	},
 };
 
-module_platform_driver(wdsp_glink_driver);
+static int __init wdsp_glink_driver_init(void)
+{
+	return platform_driver_register(&wdsp_glink_driver);
+}
+deferred_module_init(wdsp_glink_driver_init);
 
 MODULE_DESCRIPTION("SoC WCD_DSP GLINK Driver");
 MODULE_LICENSE("GPL v2");

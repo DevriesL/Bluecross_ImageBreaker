@@ -11115,7 +11115,11 @@ static struct platform_driver tavil_codec_driver = {
 	},
 };
 
-module_platform_driver(tavil_codec_driver);
+static int __init tavil_codec_driver_init(void)
+{
+	return platform_driver_register(&tavil_codec_driver);
+}
+deferred_module_init(tavil_codec_driver_init);
 
 MODULE_DESCRIPTION("Tavil Codec driver");
 MODULE_LICENSE("GPL v2");

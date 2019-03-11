@@ -1688,7 +1688,11 @@ static struct i2c_driver cs35l36_i2c_driver = {
 	.remove = cs35l36_i2c_remove,
 };
 
-module_i2c_driver(cs35l36_i2c_driver);
+static int __init cs35l36_i2c_driver_init(void)
+{
+	return i2c_add_driver(&cs35l36_i2c_driver);
+}
+deferred_module_init(cs35l36_i2c_driver_init);
 
 MODULE_DESCRIPTION("ASoC CS35L36 driver");
 MODULE_AUTHOR("Brian Austin, Cirrus Logic Inc, <brian.austin@cirrus.com>");
