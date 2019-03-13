@@ -670,6 +670,8 @@ int dsi_display_cont_splash_config(void *display);
 int dsi_display_get_panel_vfp(void *display,
 	int h_active, int v_active);
 
+struct dsi_display *get_main_display(void);
+
 /**
  * dsi_display_get_esd_mode() - get ESD mode from DSI display
  * @display: Handle to display
