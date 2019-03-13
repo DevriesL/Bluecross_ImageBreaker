@@ -21,6 +21,7 @@
 #include <video/mipi_display.h>
 
 #include "dsi_panel.h"
+#include "exposure_adjustment.h"
 
 #define BL_NODE_NAME_SIZE 32
 
@@ -262,6 +263,8 @@ static int dsi_backlight_update_status(struct backlight_device *bd)
 		 */
 		if (panel->vr_mode && (bl_lvl < bl->bl_vr_min_safe_level))
 			bl_lvl = bl->bl_vr_min_safe_level;
+		else
+			bl_lvl = ea_panel_calc_backlight(bl_lvl);
 
 		pr_info("req:%d bl:%d state:0x%x\n",
 			bd->props.brightness, bl_lvl, bd->props.state);
