@@ -987,8 +987,13 @@ static int __ref kernel_init(void *unused)
 
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
-		if (!ret)
+		if (!ret) {
+#ifdef CONFIG_DEFERRED_INITCALLS
+			// Magisk will execute command from unpacked ramdisk image
+			schedule_delayed_work(&deferred_initcall_work, msecs_to_jiffies(500));
+#endif
 			return 0;
+		}
 		pr_err("Failed to execute %s (error %d)\n",
 		       ramdisk_execute_command, ret);
 	}
