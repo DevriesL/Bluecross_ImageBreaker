@@ -39,7 +39,11 @@ static DEFINE_IDR(zram_index_idr);
 static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
+#ifdef CONFIG_CRYPTO_ZSTD
+static const char *default_compressor = "zstd";
+#else
 static const char *default_compressor = "lzo";
+#endif
 
 /*
  * We don't need to see memory allocation errors more than once every 1
@@ -353,6 +357,7 @@ static ssize_t comp_algorithm_show(struct device *dev,
 	return sz;
 }
 
+#ifndef CONFIG_CRYPTO_ZSTD
 static ssize_t comp_algorithm_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
@@ -380,6 +385,7 @@ static ssize_t comp_algorithm_store(struct device *dev,
 	up_write(&zram->init_lock);
 	return len;
 }
+#endif
 
 static ssize_t compact_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
@@ -1201,7 +1207,11 @@ static DEVICE_ATTR_RO(mem_used_total);
 static DEVICE_ATTR_RW(mem_limit);
 static DEVICE_ATTR_RW(mem_used_max);
 static DEVICE_ATTR_RW(max_comp_streams);
+#ifndef CONFIG_CRYPTO_ZSTD
 static DEVICE_ATTR_RW(comp_algorithm);
+#else
+static DEVICE_ATTR_RO(comp_algorithm);
+#endif
 
 static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_disksize.attr,
