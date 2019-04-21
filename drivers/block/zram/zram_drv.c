@@ -25,6 +25,7 @@
 #include <linux/genhd.h>
 #include <linux/highmem.h>
 #include <linux/slab.h>
+#include <linux/kthread.h>
 #include <linux/backing-dev.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
@@ -74,6 +75,93 @@ static ssize_t name##_show(struct device *d,				\
 		(u64)atomic64_read(&zram->stats.name));			\
 }									\
 static DEVICE_ATTR_RO(name);
+
+static int zram_rw_page_sync(struct zram *zram, struct bio_vec *bvec,
+				u32 index, int offset, bool is_write);
+static void zram_make_request_sync(struct zram *zram, struct bio *bio);
+
+struct zram_op sync_op = {
+	.rw_page = zram_rw_page_sync,
+	.make_request = zram_make_request_sync,
+};
+
+#ifdef CONFIG_ZRAM_ASYNC_IO
+
+#define ZRAM_QUEUE_DEPTH 32
+#define NR_BATCH_PAGES 2
+
+static int create_threads(struct zram *zram);
+static void destroy_threads(void);
+static void get_page_requests(struct list_head *page_list);
+static void page_requests_rw(struct list_head *req_list);
+static int zram_rw_page_async(struct zram *zram, struct bio_vec *bvec,
+				u32 index, int offset, bool is_write);
+static void zram_make_request_async(struct zram *zram, struct bio *bio);
+static void wake_up_thread(void);
+
+struct bio_request {
+	/*
+	 * The number of pages remained in the bio which is not handled yet
+	 * so the bio will be freed when nr_pages is zero.
+	 */
+	atomic_t nr_pages;
+	/* bio to be freed when every page_request is done */
+	struct bio *bio;
+};
+
+struct page_request {
+	struct zram *zram;
+	struct bio_vec bvec;
+	u32 index;
+	int offset;
+	struct list_head list;
+	struct bio_request *bio_req;
+};
+
+struct zram_thread {
+	struct task_struct *task;
+	struct list_head list;
+};
+
+struct kmem_cache;
+
+struct zram_threads {
+	spinlock_t req_lock;
+	struct list_head req_list;
+	unsigned int nr_req;
+
+	int running_threads;	/* the number of running threads */
+	struct list_head idle_list;
+
+	struct kmem_cache *page_cachep;
+	struct kmem_cache *bio_cachep;
+} worker;
+
+struct zram_op async_op = {
+	.rw_page = zram_rw_page_async,
+	.make_request = zram_make_request_async,
+};
+
+static void set_ops(struct zram *zram)
+{
+	if (zram->async)
+		zram->op = &async_op;
+	else
+		zram->op = &sync_op;
+}
+
+#else
+
+static int create_threads(struct zram *zram)
+{
+	return 0;
+}
+static void destroy_threads(void) {}
+static void set_ops(struct zram *zram)
+{
+	zram->op = &sync_op;
+}
+#endif
 
 static inline bool init_done(struct zram *zram)
 {
@@ -917,7 +1005,25 @@ static int zram_bvec_rw(struct zram *zram, struct bio_vec *bvec, u32 index,
 	return ret;
 }
 
-static void __zram_make_request(struct zram *zram, struct bio *bio)
+static int zram_rw_page_sync(struct zram *zram, struct bio_vec *bvec,
+				u32 index, int offset, bool is_write)
+{
+	int err = zram_bvec_rw(zram, bvec, index, offset, is_write);
+	/*
+	 * If I/O fails, just return error(ie, non-zero) without
+	 * calling page_endio.
+	 * It causes resubmit the I/O with bio request by upper functions
+	 * of rw_page(e.g., swap_readpage, __swap_writepage) and
+	 * bio->bi_end_io does things to handle the error
+	 * (e.g., SetPageError, set_page_dirty and extra works).
+	 */
+	if (err == 0)
+		page_endio(bvec->bv_page, is_write, 0);
+
+	return err;
+}
+
+static void zram_make_request_sync(struct zram *zram, struct bio *bio)
 {
 	int offset;
 	u32 index;
@@ -987,7 +1093,7 @@ static blk_qc_t zram_make_request(struct request_queue *queue, struct bio *bio)
 		goto error;
 	}
 
-	__zram_make_request(zram, bio);
+	zram->op->make_request(zram, bio);
 	return BLK_QC_T_NONE;
 
 error:
@@ -1013,7 +1119,7 @@ static void zram_slot_free_notify(struct block_device *bdev,
 static int zram_rw_page(struct block_device *bdev, sector_t sector,
 		       struct page *page, bool is_write)
 {
-	int offset, err = -EIO;
+	int offset;
 	u32 index;
 	struct zram *zram;
 	struct bio_vec bv;
@@ -1022,8 +1128,7 @@ static int zram_rw_page(struct block_device *bdev, sector_t sector,
 
 	if (!valid_io_request(zram, sector, PAGE_SIZE)) {
 		atomic64_inc(&zram->stats.invalid_io);
-		err = -EINVAL;
-		goto out;
+		return -EINVAL;
 	}
 
 	index = sector >> SECTORS_PER_PAGE_SHIFT;
@@ -1033,19 +1138,7 @@ static int zram_rw_page(struct block_device *bdev, sector_t sector,
 	bv.bv_len = PAGE_SIZE;
 	bv.bv_offset = 0;
 
-	err = zram_bvec_rw(zram, &bv, index, offset, is_write);
-out:
-	/*
-	 * If I/O fails, just return error(ie, non-zero) without
-	 * calling page_endio.
-	 * It causes resubmit the I/O with bio request by upper functions
-	 * of rw_page(e.g., swap_readpage, __swap_writepage) and
-	 * bio->bi_end_io does things to handle the error
-	 * (e.g., SetPageError, set_page_dirty and extra works).
-	 */
-	if (err == 0)
-		page_endio(page, is_write, 0);
-	return err;
+	return zram->op->rw_page(zram, &bv, index, offset, is_write);
 }
 
 static void zram_reset_device(struct zram *zram)
@@ -1112,10 +1205,13 @@ static ssize_t disksize_store(struct device *dev,
 		err = -EBUSY;
 		goto out_destroy_comp;
 	}
-
+	err = create_threads(zram);
+	if (err)
+		goto out_destroy_comp;
 	zram->meta = meta;
 	zram->comp = comp;
 	zram->disksize = disksize;
+	set_ops(zram);
 	set_capacity(zram->disk, zram->disksize >> SECTOR_SHIFT);
 	zram_revalidate_disk(zram);
 	up_write(&zram->init_lock);
@@ -1212,6 +1308,83 @@ static DEVICE_ATTR_RW(comp_algorithm);
 static DEVICE_ATTR_RO(comp_algorithm);
 #endif
 
+#ifdef CONFIG_ZRAM_ASYNC_IO
+
+static ssize_t async_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	int num, ret;
+	struct zram *zram = dev_to_zram(dev);
+
+	ret = kstrtoint(buf, 0, &num);
+	if (ret < 0)
+		return ret;
+	if (num < 0)
+		return -EINVAL;
+
+	down_read(&zram->init_lock);
+	if (init_done(zram)) {
+		up_read(&zram->init_lock);
+		return -EINVAL;
+	}
+
+	if (num == 0)
+		zram->async = false;
+	else
+		zram->async = true;
+	up_read(&zram->init_lock);
+
+	return len;
+}
+
+static ssize_t async_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", zram->async);
+}
+
+static DEVICE_ATTR_RW(async);
+
+static ssize_t max_write_threads_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	int num, ret;
+	struct zram *zram = dev_to_zram(dev);
+
+	ret = kstrtoint(buf, 0, &num);
+	if (ret < 0)
+		return ret;
+	if (num < 0)
+		return -EINVAL;
+
+	down_read(&zram->init_lock);
+	if (init_done(zram)) {
+		up_read(&zram->init_lock);
+		return -EINVAL;
+	}
+
+	if (zram->async)
+		zram->max_write_threads = num;
+	else
+		zram->max_write_threads = 0;
+	up_read(&zram->init_lock);
+
+	return len;
+}
+
+static ssize_t max_write_threads_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", zram->max_write_threads);
+}
+
+static DEVICE_ATTR_RW(max_write_threads);
+#endif
+
 static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_disksize.attr,
 	&dev_attr_initstate.attr,
@@ -1234,6 +1407,10 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_io_stat.attr,
 	&dev_attr_mm_stat.attr,
 	&dev_attr_debug_stat.attr,
+#ifdef CONFIG_ZRAM_ASYNC_IO
+	&dev_attr_async.attr,
+	&dev_attr_max_write_threads.attr,
+#endif
 	NULL,
 };
 
@@ -1332,6 +1509,10 @@ static int zram_add(void)
 		goto out_free_disk;
 	}
 	strlcpy(zram->compressor, default_compressor, sizeof(zram->compressor));
+#ifdef CONFIG_ZRAM_ASYNC_IO
+	zram->async = true;
+	zram->max_write_threads = 4;
+#endif
 	zram->meta = NULL;
 
 	pr_info("Added device: %s\n", zram->disk->disk_name);
@@ -1469,6 +1650,357 @@ static void destroy_devices(void)
 	unregister_blkdev(zram_major, "zram");
 }
 
+#ifdef CONFIG_ZRAM_ASYNC_IO
+
+static void flush_pending_io(void)
+{
+	spin_lock(&worker.req_lock);
+	wake_up_thread();
+	spin_unlock(&worker.req_lock);
+
+	while (1) {
+		LIST_HEAD(page_list);
+
+		spin_lock(&worker.req_lock);
+		get_page_requests(&page_list);
+		if (list_empty(&page_list)) {
+			spin_unlock(&worker.req_lock);
+			break;
+		}
+		spin_unlock(&worker.req_lock);
+		page_requests_rw(&page_list);
+	}
+}
+
+static bool queue_page_request(struct zram *zram, struct bio_vec *bvec,
+				u32 index, int offset)
+{
+	struct page_request *page_req;
+
+	page_req = kmem_cache_alloc(worker.page_cachep, GFP_NOIO);
+	if (!page_req)
+		return false;
+
+	page_req->bio_req = NULL;
+	page_req->zram = zram;
+	page_req->bvec = *bvec;
+	page_req->index = index;
+	page_req->offset = offset;
+
+	spin_lock(&worker.req_lock);
+	list_add(&page_req->list, &worker.req_list);
+	worker.nr_req++;
+	wake_up_thread();
+	spin_unlock(&worker.req_lock);
+
+	return true;
+}
+
+static int zram_rw_page_async(struct zram *zram, struct bio_vec *bvec, u32 index,
+			int offset, bool is_write)
+{
+	if (!is_write)
+		goto sync;
+
+	if (worker.nr_req <= (ZRAM_QUEUE_DEPTH * zram->max_write_threads))
+		if (queue_page_request(zram, bvec, index, offset)) {
+			SetPageAsyncWriteback(bvec->bv_page);
+			return 0;
+		}
+	flush_pending_io();
+sync:
+	return zram_rw_page_sync(zram, bvec, index, offset, is_write);
+}
+
+static struct page_request *get_page_request(struct zram *zram,
+				struct bio_request *bio_req,
+				struct bio_vec *bvec, u32 index,
+				int offset)
+{
+	struct page_request *page_req = kmem_cache_alloc(worker.page_cachep,
+							GFP_NOIO);
+	if (page_req) {
+		page_req->bio_req = bio_req;
+		page_req->zram = zram;
+		page_req->bvec = *bvec;
+		page_req->index = index;
+		page_req->offset = offset;
+	}
+
+	return page_req;
+}
+
+static void wake_up_thread(void)
+{
+	struct zram_thread *thread;
+	unsigned int online_cpus;
+
+	assert_spin_locked(&worker.req_lock);
+	online_cpus = num_online_cpus();
+
+	if (!list_empty(&worker.idle_list) &&
+			(worker.running_threads << 1) < online_cpus) {
+		thread = list_first_entry(&worker.idle_list,
+				struct zram_thread, list);
+		list_del(&thread->list);
+		worker.running_threads++;
+		wake_up_process(thread->task);
+	}
+}
+
+static void zram_make_request_async(struct zram *zram, struct bio *bio)
+{
+	int offset;
+	u32 index;
+	struct bio_vec bvec;
+	struct bvec_iter iter;
+	LIST_HEAD(req_list);
+	struct bio_request *bio_req;
+	struct page_request *page_req;
+	unsigned int nr_pages = 0;
+
+	if (!op_is_write(bio_op(bio)))
+		goto sync;
+
+	bio_req = kmem_cache_alloc(worker.bio_cachep, GFP_NOIO);
+	if (!bio_req)
+		goto sync;
+
+	bio_req->bio = bio;
+	index = bio->bi_iter.bi_sector >> SECTORS_PER_PAGE_SHIFT;
+	offset = (bio->bi_iter.bi_sector & (SECTORS_PER_PAGE - 1))
+			<< SECTOR_SHIFT;
+
+	bio_for_each_segment(bvec, bio, iter) {
+		int max_transfer_size = PAGE_SIZE - offset;
+
+		if (bvec.bv_len > max_transfer_size) {
+			struct bio_vec bv;
+
+			bv.bv_page = bvec.bv_page;
+			bv.bv_len = max_transfer_size;
+			bv.bv_offset = bvec.bv_offset;
+
+			page_req = get_page_request(zram, bio_req, &bv,
+						index, offset);
+			if (!page_req)
+				goto error;
+			list_add(&page_req->list, &req_list);
+
+			bv.bv_len = bvec.bv_len - max_transfer_size;
+			bv.bv_offset += max_transfer_size;
+
+			page_req = get_page_request(zram, bio_req, &bv,
+						index + 1, 0);
+			if (!page_req)
+				goto error;
+			list_add(&page_req->list, &req_list);
+		} else {
+
+			page_req = get_page_request(zram, bio_req, &bvec,
+					index, offset);
+			if (!page_req)
+				goto error;
+			list_add(&page_req->list, &req_list);
+		}
+
+		nr_pages++;
+		update_position(&index, &offset, &bvec);
+	}
+
+	atomic_set(&bio_req->nr_pages, nr_pages);
+
+	spin_lock(&worker.req_lock);
+	list_splice(&req_list, &worker.req_list);
+	worker.nr_req += nr_pages;
+	wake_up_thread();
+	spin_unlock(&worker.req_lock);
+	if (worker.nr_req > (ZRAM_QUEUE_DEPTH * zram->max_write_threads))
+		flush_pending_io();
+
+	return;
+error:
+	while (!list_empty(&req_list)) {
+		page_req = list_first_entry(&req_list, struct page_request, list);
+		list_del(&page_req->list);
+		kmem_cache_free(worker.page_cachep, page_req);
+	}
+	kmem_cache_free(worker.bio_cachep, bio_req);
+sync:
+	zram_make_request_sync(zram, bio);
+}
+
+/*
+ * @page_list: pages isolated from request queue
+ */
+static void get_page_requests(struct list_head *page_list)
+{
+	struct page_request *page_req;
+	int nr_pages;
+
+	for (nr_pages = 0; nr_pages < NR_BATCH_PAGES &&
+		!list_empty(&worker.req_list); nr_pages++) {
+		page_req = list_last_entry(&worker.req_list,
+					struct page_request, list);
+		list_move(&page_req->list, page_list);
+	}
+
+	worker.nr_req -= nr_pages;
+}
+
+static void page_requests_rw(struct list_head *req_list)
+{
+	struct page_request *page_req;
+	struct page *page;
+	struct zram *zram;
+	int err;
+	bool bio_free;
+	struct bio_request *bio_req;
+
+	while (!list_empty(req_list)) {
+		page_req = list_last_entry(req_list, struct page_request,
+					list);
+		page = page_req->bvec.bv_page;
+		zram = page_req->zram;
+		bio_req = page_req->bio_req;
+		bio_free = false;
+
+		/* bio-based request */
+		if (bio_req && atomic_dec_and_test(&bio_req->nr_pages))
+			bio_free = true;
+
+		list_del(&page_req->list);
+
+		err = zram_bvec_rw(zram, &page_req->bvec, page_req->index,
+					page_req->offset, 1);
+		kmem_cache_free(worker.page_cachep, page_req);
+		if (!bio_req) {
+			if (unlikely(err)) {
+				/*
+				 * Re-dirty the page in order to avoid it
+				 * being reclaimed.
+				 */
+				set_page_dirty(page);
+				ClearPageReclaim(page);
+			}
+			page_endio(page, true, err);
+			continue;
+		}
+
+		if (bio_free) {
+			if (likely(!err))
+				bio_endio(bio_req->bio);
+			else
+				bio_io_error(bio_req->bio);
+			kmem_cache_free(worker.bio_cachep, bio_req);
+			continue;
+		}
+
+		cond_resched();
+	}
+}
+
+static int zram_thread(void *data)
+{
+	LIST_HEAD(page_list);
+	struct zram_thread *thread = data;
+
+	while (!kthread_should_stop()) {
+		struct list_head *list;
+		int double_add = 0;
+
+		spin_lock(&worker.req_lock);
+		if (list_empty(&worker.req_list)) {
+			__set_current_state(TASK_INTERRUPTIBLE);
+			/* We found abnormal wakeup and list_add double.
+			 * Workaround: check list before adding
+			 */
+			list_for_each(list, &worker.idle_list) {
+				if (list == &thread->list) {
+					double_add = 1;
+					break;
+				}
+			}
+			if (!double_add) {
+				list_add(&thread->list, &worker.idle_list);
+				worker.running_threads--;
+			}
+			spin_unlock(&worker.req_lock);
+			schedule();
+			set_current_state(TASK_RUNNING);
+			continue;
+		}
+
+		get_page_requests(&page_list);
+		if (worker.nr_req)
+			wake_up_thread();
+		spin_unlock(&worker.req_lock);
+		page_requests_rw(&page_list);
+	}
+
+	return 0;
+}
+
+static void destroy_threads(void)
+{
+	struct zram_thread *thread;
+
+	while (!list_empty(&worker.idle_list)) {
+
+		thread = list_first_entry(&worker.idle_list,
+					struct zram_thread,
+					list);
+		list_del(&thread->list);
+		kthread_stop(thread->task);
+		kfree(thread);
+	}
+
+	kmem_cache_destroy(worker.page_cachep);
+	kmem_cache_destroy(worker.bio_cachep);
+}
+
+static int create_threads(struct zram *zram)
+{
+	int i, ret = -ENOMEM;
+
+	if (!zram->async)
+		return 0;
+
+	INIT_LIST_HEAD(&worker.req_list);
+	spin_lock_init(&worker.req_lock);
+	INIT_LIST_HEAD(&worker.idle_list);
+
+	worker.page_cachep = KMEM_CACHE(page_request, 0);
+	worker.bio_cachep = KMEM_CACHE(bio_request, 0);
+	if (!worker.bio_cachep || !worker.bio_cachep)
+		goto out;
+
+	for (i = 0; i < zram->max_write_threads; i++) {
+		struct zram_thread *thread;
+
+		thread = kmalloc(sizeof(*thread), GFP_KERNEL|__GFP_ZERO);
+		if (!thread)
+			goto out;
+
+		thread->task = kthread_create(zram_thread, thread,
+						"zram/%d", i);
+		if (IS_ERR(thread->task)) {
+			ret = PTR_ERR(thread->task);
+			kfree(thread);
+			goto out;
+		}
+
+		list_add(&thread->list, &worker.idle_list);
+	}
+
+	return 0;
+
+out:
+	destroy_threads();
+	return ret;
+}
+#endif
+
 static int __init zram_init(void)
 {
 	int ret;
@@ -1505,6 +2037,7 @@ out_error:
 static void __exit zram_exit(void)
 {
 	destroy_devices();
+	destroy_threads();
 }
 
 module_init(zram_init);

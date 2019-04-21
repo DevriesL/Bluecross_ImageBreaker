@@ -1206,6 +1206,17 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			case PAGE_ACTIVATE:
 				goto activate_locked;
 			case PAGE_SUCCESS:
+#ifdef CONFIG_ZRAM_ASYNC_IO
+				/*
+				 * pageout() returns page with writeback flags
+				 * during CONFIG_ZRAM_ASYNC_IO feature on.
+				 * So should make compensate nr_reclaimed.
+				 */
+				if (PageAsyncWriteback(page) && PageWriteback(page)) {
+					nr_reclaimed++;
+					ClearPageAsyncWriteback(page);
+				}
+#endif
 				if (PageWriteback(page))
 					goto keep;
 				if (PageDirty(page))
